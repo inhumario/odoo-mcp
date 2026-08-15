@@ -1,24 +1,27 @@
-# MCP de Odoo — Aromas de Té (piloto)
+# Inhumario MCP — Odoo para tu IA
 
-Servidor MCP remoto (Streamable HTTP) que expone el Odoo de Aromas por XML-RPC,
-para usarlo como conector personalizado en Claude web y móvil.
+Conecta el Odoo de cada cliente con su IA (Claude, ChatGPT o cualquier
+aplicación compatible con el estándar MCP) mediante un servidor MCP remoto
+multi-tenant con panel de autogestión.
 
-- **Fase actual (piloto)**: sin restricciones — hereda los permisos del usuario de la
-  API key (Mario, admin). Barrera de acceso: ruta secreta `MCP_PATH`.
-- **Fase 2 (producto para clientes)**: OAuth + catálogo de herramientas por rol +
-  panel de gestión. Ver `COMERCIAL.md` del proyecto Inhumario.
+- **Panel** (`app.py`): alta con código de invitación, credenciales de Odoo
+  (verificadas al guardar), URL MCP privada por cliente e instrucciones de
+  conexión. Claves de IA opcionales para el futuro chat integrado.
+- **MCP** (`server.py`): 9 herramientas XML-RPC (buscar, contar, leer, crear,
+  escribir, ejecutar genérico, campos, modelos, info) con las credenciales del
+  tenant activo. Endpoint por cliente: `/t/<token>/mcp` (Streamable HTTP).
 
 ## Despliegue
 
-EasyPanel (easypanel.aromasdete.com), proyecto `n8n`, servicio `odoo-mcp`,
-build por Dockerfile desde este repo (GitHub `inhumario/odoo-mcp`).
-El push a `main` NO redespliega solo — disparar con
-`services.app.deployService` (ver memoria `deploy-easypanel`).
+EasyPanel, proyecto `travelia`, servicio `odoo-mcp`, build por Dockerfile.
+Volumen en `/data` para SQLite. El push a `main` NO redespliega — disparar
+`services.app.deployService`.
 
-Variables de entorno del servicio: `ODOO_URL`, `ODOO_DB`, `ODOO_USER`,
-`ODOO_API_KEY`, `MCP_PATH`, `PORT=8000`.
+Env: `SECRET_KEY`, `ALTA_CODIGO`, `DB_PATH=/data/tenants.db`,
+`BASE_URL=https://mcp.inhumario.com`, `PORT=8000` y opcionalmente
+`MCP_PATH` + `ODOO_*` para la ruta legacy mono-tenant.
 
-## Herramientas
+## Hoja de ruta (fase producto)
 
-`odoo_buscar`, `odoo_contar`, `odoo_leer`, `odoo_crear`, `odoo_escribir`,
-`odoo_ejecutar` (genérico), `odoo_campos`, `odoo_modelos`, `odoo_info`.
+OAuth, herramientas por rol, cifrado de credenciales en reposo, panel de
+administración, logs de uso por tenant, chat integrado con las claves de IA.
