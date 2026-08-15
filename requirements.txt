@@ -1,1 +1,4 @@
 fastmcp>=2.10,<3
+fastapi>=0.115
+python-multipart>=0.0.9
+uvicorn>=0.30

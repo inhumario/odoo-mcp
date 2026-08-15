@@ -1,68 +1,77 @@
 """
-MCP de Odoo — Aromas de Té (piloto)
-===================================
+MCP de Odoo — Inhumario (multi-tenant)
+======================================
 
-Servidor MCP remoto (Streamable HTTP) que expone el Odoo de Aromas por XML-RPC,
-para usarlo como conector personalizado en Claude (web y móvil).
+Servidor MCP (Streamable HTTP) que expone el Odoo de CADA cliente por XML-RPC.
+Las credenciales del cliente activo llegan por contextvar (`current_tenant`),
+que fija el dispatcher de app.py a partir del token de la URL.
 
-SIN restricciones de permisos: usa la API key del usuario configurado en las
-variables de entorno y hereda sus permisos de Odoo. La única barrera de acceso
-es la ruta secreta (MCP_PATH) — fase 2: OAuth + herramientas por rol.
-
-Variables de entorno:
-  ODOO_URL, ODOO_DB, ODOO_USER, ODOO_API_KEY  — conexión XML-RPC
-  MCP_PATH  — ruta secreta del endpoint, p.ej. /mcp-a1b2c3... (obligatoria)
-  PORT      — puerto HTTP (por defecto 8000)
+Compatibilidad: si MCP_PATH + ODOO_* están en el entorno, esa ruta "legacy"
+sigue sirviendo el tenant del entorno (el conector original de Mario).
 """
 
+import contextvars
 import json
-import os
 import xmlrpc.client
 from typing import Any
 
 from fastmcp import FastMCP
 
-ODOO_URL = os.environ["ODOO_URL"].rstrip("/")
-ODOO_DB = os.environ["ODOO_DB"]
-ODOO_USER = os.environ["ODOO_USER"]
-ODOO_API_KEY = os.environ["ODOO_API_KEY"]
+# Tenant activo en esta petición: dict con odoo_url, odoo_db, odoo_user, odoo_key
+current_tenant: contextvars.ContextVar[dict] = contextvars.ContextVar("current_tenant")
 
-_uid: int | None = None
+# Cache de uid por credenciales (los tenants cambian poco)
+_uid_cache: dict[tuple, int] = {}
 
-# Límite de caracteres de cualquier respuesta para no reventar el contexto
 MAX_CHARS = 100_000
 
 
-def _common() -> xmlrpc.client.ServerProxy:
-    return xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
+def _tenant() -> dict:
+    try:
+        return current_tenant.get()
+    except LookupError:
+        raise RuntimeError("Sin tenant activo: la petición no llegó por una URL de cliente válida")
 
 
-def _models() -> xmlrpc.client.ServerProxy:
-    return xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
+def _proxy(endpoint: str, url: str) -> xmlrpc.client.ServerProxy:
+    return xmlrpc.client.ServerProxy(f"{url.rstrip('/')}/xmlrpc/2/{endpoint}", allow_none=True)
 
 
-def _get_uid() -> int:
-    global _uid
-    if _uid is None:
-        uid = _common().authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
+def _auth(t: dict) -> int:
+    key = (t["odoo_url"], t["odoo_db"], t["odoo_user"], t["odoo_key"])
+    if key not in _uid_cache:
+        uid = _proxy("common", t["odoo_url"]).authenticate(t["odoo_db"], t["odoo_user"], t["odoo_key"], {})
         if not uid:
-            raise RuntimeError("Autenticación con Odoo fallida: revisa ODOO_USER / ODOO_API_KEY")
-        _uid = uid
-    return _uid
+            raise RuntimeError("Autenticación con Odoo fallida: revisa usuario y API key en el panel")
+        _uid_cache[key] = uid
+    return _uid_cache[key]
+
+
+def probar_conexion(t: dict) -> dict:
+    """Usado por el panel para validar credenciales. Lanza excepción si algo falla."""
+    version = _proxy("common", t["odoo_url"]).version()
+    uid = _auth(t)
+    user = _proxy("object", t["odoo_url"]).execute_kw(
+        t["odoo_db"], uid, t["odoo_key"], "res.users", "read", [[uid]], {"fields": ["name", "login"]}
+    )
+    return {"version": version.get("server_version"), "usuario": user[0]["name"], "login": user[0]["login"]}
 
 
 def _execute(model: str, method: str, args: list, kwargs: dict | None = None) -> Any:
-    global _uid
+    t = _tenant()
+    key = (t["odoo_url"], t["odoo_db"], t["odoo_user"], t["odoo_key"])
     try:
-        return _models().execute_kw(ODOO_DB, _get_uid(), ODOO_API_KEY, model, method, args, kwargs or {})
+        return _proxy("object", t["odoo_url"]).execute_kw(
+            t["odoo_db"], _auth(t), t["odoo_key"], model, method, args, kwargs or {}
+        )
     except xmlrpc.client.Fault:
-        # Si la sesión/uid se invalidó, reintenta una vez re-autenticando
-        _uid = None
-        return _models().execute_kw(ODOO_DB, _get_uid(), ODOO_API_KEY, model, method, args, kwargs or {})
+        _uid_cache.pop(key, None)
+        return _proxy("object", t["odoo_url"]).execute_kw(
+            t["odoo_db"], _auth(t), t["odoo_key"], model, method, args, kwargs or {}
+        )
 
 
 def _clean(value: Any) -> Any:
-    """Convierte tipos no serializables (bytes, datetime XML-RPC) a texto y poda binarios."""
     if isinstance(value, bytes):
         return f"<binario: {len(value)} bytes omitidos>"
     if isinstance(value, xmlrpc.client.DateTime):
@@ -88,16 +97,15 @@ def _result(value: Any) -> Any:
 
 
 mcp = FastMCP(
-    "Odoo Aromas de Té",
+    "Odoo por Inhumario",
     instructions=(
-        "Acceso completo al Odoo de Aromas de Té S.L. (aromasdete.odoo.com) vía XML-RPC. "
-        "Los modelos habituales: sale.order (pedidos), account.move (facturas/asientos), "
+        "Acceso al Odoo de la empresa del usuario vía XML-RPC. "
+        "Modelos habituales: sale.order (pedidos), account.move (facturas/asientos), "
         "res.partner (clientes/proveedores), product.template y product.product (productos), "
-        "stock.picking (albaranes), account.bank.statement.line (líneas bancarias). "
-        "La empresa principal es res.company id 1. Fechas en formato 'YYYY-MM-DD'. "
+        "stock.picking (albaranes). Fechas en formato 'YYYY-MM-DD'. "
         "Antes de escribir en un modelo que no conozcas, consulta sus campos con odoo_campos. "
-        "PRECAUCIÓN: es la base de datos de PRODUCCIÓN — confirma con el usuario antes de "
-        "crear, modificar o ejecutar acciones con efecto contable."
+        "PRECAUCIÓN: normalmente es la base de datos de PRODUCCIÓN de la empresa — confirma "
+        "con el usuario antes de crear, modificar o ejecutar acciones con efecto contable."
     ),
 )
 
@@ -224,19 +232,5 @@ def odoo_modelos(buscar: str) -> Any:
 @mcp.tool
 def odoo_info() -> Any:
     """Comprueba la conexión con Odoo y devuelve versión del servidor y usuario conectado."""
-    version = _common().version()
-    uid = _get_uid()
-    user = _execute("res.users", "read", [[uid]], {"fields": ["name", "login", "company_id"]})
-    return _result({"version": version.get("server_version"), "usuario": user})
-
-
-if __name__ == "__main__":
-    path = os.environ["MCP_PATH"]
-    if not path.startswith("/"):
-        path = "/" + path
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8000")),
-        path=path,
-    )
+    t = _tenant()
+    return _result(probar_conexion(t))
