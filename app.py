@@ -31,6 +31,7 @@ import anthropic
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 import server as srv
 from server import mcp, current_tenant, probar_conexion
@@ -238,6 +239,7 @@ class RootDispatcher:
 # ---------------------------------------------------------------- FastAPI
 
 panel_app = FastAPI(lifespan=mcp_app.lifespan)
+panel_app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")))
 init_db()
 app = RootDispatcher(panel_app, mcp_app)
 
@@ -245,54 +247,63 @@ app = RootDispatcher(panel_app, mcp_app)
 # ---------------------------------------------------------------- HTML
 
 CSS = """
-:root { --verde-osc:#0E4A31; --verde:#1F7A50; --verde-cl:#35996A; --fondo:#F5FAF7;
-        --cabecera:#EAF4EE; --borde:#C9DED3; --texto:#1F2D26; }
+:root { --ink:#111111; --ink-soft:#1F1F1F; --mute:#666666; --light:#B5B5B5;
+        --card:#F7F7F7; --line:#E5E5E5; --acento:#FF8080;
+        --verde-osc:#111111; --verde:#111111; --verde-cl:#B5B5B5;
+        --fondo:#F7F7F7; --cabecera:#F7F7F7; --borde:#E5E5E5; --texto:#111111; }
 * { box-sizing:border-box; margin:0; }
-body { font-family:-apple-system,'Segoe UI',Roboto,sans-serif; background:var(--fondo);
-       color:var(--texto); line-height:1.55; }
-header { background:var(--verde-osc); color:#fff; padding:14px 20px; display:flex;
-         justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
-header h1 { font-size:1.15rem; font-weight:600; }
-header nav { display:flex; gap:16px; }
-header a { color:#EAF4EE; text-decoration:none; font-size:.9rem; }
-main { max-width:900px; margin:24px auto; padding:0 16px 48px; }
-.card { background:#fff; border:1px solid var(--borde); border-radius:10px;
-        padding:22px; margin-bottom:20px; }
-.card h2 { color:var(--verde-osc); font-size:1.05rem; margin-bottom:12px;
-           border-bottom:2px solid var(--verde-cl); padding-bottom:6px; }
-label { display:block; font-size:.85rem; font-weight:600; margin:10px 0 4px; }
-input { width:100%; padding:10px; border:1px solid var(--borde); border-radius:6px;
-        font-size:.95rem; }
-button { background:var(--verde); color:#fff; border:0; border-radius:6px;
-         padding:11px 20px; font-size:.95rem; font-weight:600; cursor:pointer; margin-top:14px; }
-button:hover { background:var(--verde-osc); }
-.btn-rojo { background:#8C2F1F; } .btn-mini { padding:6px 12px; font-size:.8rem; margin:2px; }
-.aviso-ok { background:var(--cabecera); border:1px solid var(--verde-cl); color:var(--verde-osc);
-            padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:.9rem; }
-.aviso-err { background:#FBEDEA; border:1px solid #E0B4AB; color:#7A2E1F;
-             padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:.9rem; }
-.url-mcp { background:var(--cabecera); border:1px dashed var(--verde-cl); border-radius:6px;
+body { font-family:Calibri,'Helvetica Neue',Arial,sans-serif; background:#FFFFFF;
+       color:var(--ink); line-height:1.55; }
+header { background:var(--ink); color:#fff; padding:14px 22px; display:flex;
+         justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }
+header .logo img { height:26px; display:block; }
+header nav { display:flex; gap:18px; }
+header a { color:#fff; text-decoration:none; font-size:.9rem; letter-spacing:.02em; }
+header a:hover { color:var(--acento); }
+main { max-width:900px; margin:26px auto; padding:0 16px 48px; }
+.card { background:#fff; border:1px solid var(--line); border-radius:12px;
+        padding:24px; margin-bottom:20px; }
+.card h2 { color:var(--ink); font-size:1.08rem; margin-bottom:12px;
+           border-bottom:2px solid var(--ink); padding-bottom:7px; letter-spacing:.01em; }
+.card h3 { color:var(--ink) !important; }
+label { display:block; font-size:.85rem; font-weight:600; margin:10px 0 4px; color:var(--ink-soft); }
+input { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px;
+        font-size:.95rem; font-family:inherit; background:#fff; }
+input:focus { outline:2px solid var(--ink); border-color:var(--ink); }
+button { background:var(--ink); color:#fff; border:0; border-radius:8px;
+         padding:11px 22px; font-size:.95rem; font-weight:600; cursor:pointer;
+         margin-top:14px; font-family:inherit; }
+button:hover { background:var(--ink-soft); }
+.btn-rojo { background:var(--acento); color:var(--ink); } .btn-rojo:hover { background:#ff9a9a; }
+.btn-mini { padding:6px 12px; font-size:.8rem; margin:2px; }
+.aviso-ok { background:var(--card); border:1px solid var(--ink); color:var(--ink);
+            padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:.9rem; }
+.aviso-err { background:#FFF1F0; border:1px solid var(--acento); color:#A03030;
+             padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:.9rem; }
+.url-mcp { background:var(--card); border:1px dashed var(--light); border-radius:8px;
            padding:12px; font-family:ui-monospace,monospace; font-size:.8rem;
            word-break:break-all; margin:8px 0; }
 .pasos li { margin-bottom:8px; }
-.nota { font-size:.82rem; color:#5A6E63; margin-top:6px; }
+a { color:var(--ink); } main a:hover { color:var(--acento); }
+.nota { font-size:.82rem; color:var(--mute); margin-top:6px; }
 .fila { display:flex; gap:14px; flex-wrap:wrap; }
 .fila > div { flex:1; min-width:220px; }
 table { width:100%; border-collapse:collapse; font-size:.85rem; }
 .tabla-scroll { overflow-x:auto; }
-th { background:var(--cabecera); color:var(--verde-osc); text-align:left; padding:8px; }
-td { padding:8px; border-bottom:1px solid var(--borde); }
-tr:nth-child(even) td { background:var(--fondo); }
-#chat-caja { border:1px solid var(--borde); border-radius:8px; height:420px; overflow-y:auto;
-             padding:14px; background:var(--fondo); margin-bottom:10px; }
-.msg { max-width:85%; padding:10px 14px; border-radius:10px; margin-bottom:10px;
+th { background:var(--card); color:var(--ink); text-align:left; padding:8px; }
+td { padding:8px; border-bottom:1px solid var(--line); }
+tr:nth-child(even) td { background:var(--card); }
+#chat-caja { border:1px solid var(--line); border-radius:10px; height:420px; overflow-y:auto;
+             padding:14px; background:var(--card); margin-bottom:10px; }
+.msg { max-width:85%; padding:10px 14px; border-radius:12px; margin-bottom:10px;
        white-space:pre-wrap; font-size:.92rem; }
-.msg-u { background:var(--verde); color:#fff; margin-left:auto; }
-.msg-a { background:#fff; border:1px solid var(--borde); }
-.msg-s { background:var(--cabecera); color:#5A6E63; font-size:.8rem; font-style:italic; }
+.msg-u { background:var(--ink); color:#fff; margin-left:auto; }
+.msg-a { background:#fff; border:1px solid var(--line); }
+.msg-s { background:#EFEFEF; color:var(--mute); font-size:.8rem; font-style:italic; }
 #chat-form { display:flex; gap:8px; }
 #chat-form input { flex:1; } #chat-form button { margin-top:0; }
-@media (max-width:600px){ .card{padding:16px} main{margin-top:14px} .msg{max-width:95%} }
+@media (max-width:600px){ .card{padding:16px} main{margin-top:14px} .msg{max-width:95%}
+                          header .logo img{height:22px} }
 """
 
 
@@ -306,8 +317,10 @@ def page(title: str, body: str, logged: bool = False, admin: bool = False) -> HT
         nav = "<nav>" + "".join(links) + "</nav>"
     return HTMLResponse(f"""<!doctype html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Inhumario MCP</title><style>{CSS}</style></head><body>
-<header><h1>🔌 Inhumario · Odoo para tu IA</h1>{nav}</header>
+<title>{title} — Inhumario</title>
+<link rel="icon" type="image/png" href="/static/icon-square.png">
+<style>{CSS}</style></head><body>
+<header><a class="logo" href="/panel"><img src="/static/logo-white.png" alt="Inhumario"></a>{nav}</header>
 <main>{body}</main></body></html>""")
 
 
