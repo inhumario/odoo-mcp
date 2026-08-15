@@ -17,11 +17,14 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-# Tenant activo en esta petición: dict con odoo_url, odoo_db, odoo_user, odoo_key
+# Tenant activo en esta petición: dict con id, odoo_url, odoo_db, odoo_user, odoo_key
 current_tenant: contextvars.ContextVar[dict] = contextvars.ContextVar("current_tenant")
 
 # Cache de uid por credenciales (los tenants cambian poco)
 _uid_cache: dict[tuple, int] = {}
+
+# Hook opcional que fija app.py para registrar el uso: fn(tenant_id, modelo, metodo)
+USAGE_LOGGER = None
 
 MAX_CHARS = 100_000
 
@@ -61,14 +64,20 @@ def _execute(model: str, method: str, args: list, kwargs: dict | None = None) ->
     t = _tenant()
     key = (t["odoo_url"], t["odoo_db"], t["odoo_user"], t["odoo_key"])
     try:
-        return _proxy("object", t["odoo_url"]).execute_kw(
+        result = _proxy("object", t["odoo_url"]).execute_kw(
             t["odoo_db"], _auth(t), t["odoo_key"], model, method, args, kwargs or {}
         )
     except xmlrpc.client.Fault:
         _uid_cache.pop(key, None)
-        return _proxy("object", t["odoo_url"]).execute_kw(
+        result = _proxy("object", t["odoo_url"]).execute_kw(
             t["odoo_db"], _auth(t), t["odoo_key"], model, method, args, kwargs or {}
         )
+    if USAGE_LOGGER:
+        try:
+            USAGE_LOGGER(t.get("id"), model, method)
+        except Exception:
+            pass
+    return result
 
 
 def _clean(value: Any) -> Any:

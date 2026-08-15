@@ -1,47 +1,75 @@
 """
-Panel de clientes + dispatcher MCP multi-tenant — Inhumario
-===========================================================
+Panel de clientes + back office + chat de demos + dispatcher MCP — Inhumario
+============================================================================
 
-- Panel web en /: alta, login, credenciales de Odoo, URL MCP propia e
-  instrucciones para conectarla a Claude, ChatGPT u otra IA compatible MCP.
-- MCP por tenant en /t/<token>/mcp (el token identifica al cliente).
-- Ruta legacy (MCP_PATH + ODOO_* del entorno) para el conector original.
+- Panel en /: alta, login, credenciales de Odoo, URL MCP propia, chat de demos.
+- Back office en /admin (solo ADMIN_EMAIL): alta/baja/borrado de tenants y uso.
+- MCP por tenant en /t/<token>/mcp; ruta legacy (MCP_PATH + ODOO_*) intacta.
+- Credenciales sensibles (API keys) cifradas en reposo con Fernet (ENCRYPT_KEY).
+- Chat de demos: usa la clave API de Claude del tenant contra su propio Odoo.
 
 Variables de entorno:
-  SECRET_KEY   — firma de cookies de sesión (obligatoria)
-  ALTA_CODIGO  — código de invitación para el alta (obligatoria)
-  DB_PATH      — sqlite, por defecto /data/tenants.db
+  SECRET_KEY    — firma de cookies de sesión (obligatoria)
+  ENCRYPT_KEY   — clave Fernet para cifrado en reposo (obligatoria)
+  ALTA_CODIGO   — código de invitación para el alta
+  ADMIN_EMAIL   — email con acceso al back office
+  DB_PATH       — sqlite, por defecto /data/tenants.db
+  BASE_URL      — URL pública, por defecto https://mcp.inhumario.com
   MCP_PATH, ODOO_URL, ODOO_DB, ODOO_USER, ODOO_API_KEY — tenant legacy (opcional)
-  PORT         — puerto (uvicorn lo lee del CMD)
 """
 
 import hashlib
 import hmac
 import html
+import json
 import os
 import secrets
 import sqlite3
 import time
 
+import anthropic
+from cryptography.fernet import Fernet
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+import server as srv
 from server import mcp, current_tenant, probar_conexion
 
 SECRET_KEY = os.environ["SECRET_KEY"]
+ENCRYPT_KEY = os.environ["ENCRYPT_KEY"]
 ALTA_CODIGO = os.environ.get("ALTA_CODIGO", "")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 DB_PATH = os.environ.get("DB_PATH", "/data/tenants.db")
 BASE_URL = os.environ.get("BASE_URL", "https://mcp.inhumario.com")
+
+fernet = Fernet(ENCRYPT_KEY.encode())
 
 LEGACY_PATH = os.environ.get("MCP_PATH", "").strip("/")
 LEGACY_TENANT = None
 if LEGACY_PATH and os.environ.get("ODOO_URL"):
     LEGACY_TENANT = {
+        "id": 0,
         "odoo_url": os.environ["ODOO_URL"],
         "odoo_db": os.environ["ODOO_DB"],
         "odoo_user": os.environ["ODOO_USER"],
         "odoo_key": os.environ["ODOO_API_KEY"],
     }
+
+# ---------------------------------------------------------------- cifrado
+
+def enc(value: str) -> str:
+    if not value:
+        return ""
+    return "enc:" + fernet.encrypt(value.encode()).decode()
+
+
+def dec(value: str) -> str:
+    if not value:
+        return ""
+    if value.startswith("enc:"):
+        return fernet.decrypt(value[4:].encode()).decode()
+    return value  # valor antiguo sin cifrar (se migra al arrancar)
+
 
 # ---------------------------------------------------------------- base de datos
 
@@ -71,14 +99,52 @@ def init_db() -> None:
                 created TEXT DEFAULT (datetime('now'))
             )
         """)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(tenants)")]
+        if "activo" not in cols:
+            conn.execute("ALTER TABLE tenants ADD COLUMN activo INTEGER DEFAULT 1")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER,
+                modelo TEXT,
+                metodo TEXT,
+                fecha TEXT DEFAULT (datetime('now'))
+            )
+        """)
+    # Migración: cifrar claves que sigan en claro
+    with db() as conn:
+        for r in conn.execute("SELECT id, odoo_key, ai_claude, ai_otras FROM tenants").fetchall():
+            cambios = {}
+            for campo in ("odoo_key", "ai_claude", "ai_otras"):
+                v = r[campo]
+                if v and not v.startswith("enc:"):
+                    cambios[campo] = enc(v)
+            if cambios:
+                sets = ", ".join(f"{c}=?" for c in cambios)
+                conn.execute(f"UPDATE tenants SET {sets} WHERE id=?", (*cambios.values(), r["id"]))
 
 
-def tenant_by(field: str, value: str) -> sqlite3.Row | None:
+def tenant_by(field: str, value) -> sqlite3.Row | None:
     with db() as conn:
         return conn.execute(f"SELECT * FROM tenants WHERE {field} = ?", (value,)).fetchone()
 
 
+def log_uso(tenant_id, modelo, metodo) -> None:
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO usos (tenant_id, modelo, metodo) VALUES (?,?,?)",
+                         (tenant_id or 0, str(modelo)[:80], str(metodo)[:80]))
+    except Exception:
+        pass
+
+
+srv.USAGE_LOGGER = log_uso
+
+
 # ---------------------------------------------------------------- auth helpers
+
+_login_fails: dict[str, list] = {}  # email -> [n_fallos, bloqueado_hasta]
+
 
 def hash_password(password: str, salt: str | None = None) -> str:
     salt = salt or secrets.token_hex(16)
@@ -110,6 +176,10 @@ def read_session(request: Request) -> sqlite3.Row | None:
     return tenant_by("email", email)
 
 
+def es_admin(row) -> bool:
+    return bool(row) and ADMIN_EMAIL and row["email"] == ADMIN_EMAIL
+
+
 def new_token() -> str:
     return "mcp-" + secrets.token_hex(24)
 
@@ -124,6 +194,11 @@ async def _plain_response(send, status: int, text: str) -> None:
     await send({"type": "http.response.start", "status": status,
                 "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
     await send({"type": "http.response.body", "body": body})
+
+
+def tenant_dict(row) -> dict:
+    return {"id": row["id"], "odoo_url": row["odoo_url"], "odoo_db": row["odoo_db"],
+            "odoo_user": row["odoo_user"], "odoo_key": dec(row["odoo_key"])}
 
 
 class RootDispatcher:
@@ -152,11 +227,9 @@ class RootDispatcher:
             parts = path.split("/")
             token = parts[2] if len(parts) > 2 else ""
             row = tenant_by("token", token) if token else None
-            if row is None or not row["odoo_url"]:
-                return await _plain_response(send, 404, "Tenant no encontrado o sin credenciales de Odoo configuradas")
-            tenant = {"odoo_url": row["odoo_url"], "odoo_db": row["odoo_db"],
-                      "odoo_user": row["odoo_user"], "odoo_key": row["odoo_key"]}
-            return await self._delegate_mcp(tenant, scope, receive, send)
+            if row is None or not row["odoo_url"] or not row["activo"]:
+                return await _plain_response(send, 404, "Tenant no encontrado, desactivado o sin credenciales de Odoo")
+            return await self._delegate_mcp(tenant_dict(row), scope, receive, send)
         if LEGACY_TENANT and path.rstrip("/") == "/" + LEGACY_PATH:
             return await self._delegate_mcp(LEGACY_TENANT, scope, receive, send)
         return await self.panel(scope, receive, send)
@@ -180,8 +253,9 @@ body { font-family:-apple-system,'Segoe UI',Roboto,sans-serif; background:var(--
 header { background:var(--verde-osc); color:#fff; padding:14px 20px; display:flex;
          justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
 header h1 { font-size:1.15rem; font-weight:600; }
+header nav { display:flex; gap:16px; }
 header a { color:#EAF4EE; text-decoration:none; font-size:.9rem; }
-main { max-width:860px; margin:24px auto; padding:0 16px 48px; }
+main { max-width:900px; margin:24px auto; padding:0 16px 48px; }
 .card { background:#fff; border:1px solid var(--borde); border-radius:10px;
         padding:22px; margin-bottom:20px; }
 .card h2 { color:var(--verde-osc); font-size:1.05rem; margin-bottom:12px;
@@ -192,6 +266,7 @@ input { width:100%; padding:10px; border:1px solid var(--borde); border-radius:6
 button { background:var(--verde); color:#fff; border:0; border-radius:6px;
          padding:11px 20px; font-size:.95rem; font-weight:600; cursor:pointer; margin-top:14px; }
 button:hover { background:var(--verde-osc); }
+.btn-rojo { background:#8C2F1F; } .btn-mini { padding:6px 12px; font-size:.8rem; margin:2px; }
 .aviso-ok { background:var(--cabecera); border:1px solid var(--verde-cl); color:var(--verde-osc);
             padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:.9rem; }
 .aviso-err { background:#FBEDEA; border:1px solid #E0B4AB; color:#7A2E1F;
@@ -203,12 +278,32 @@ button:hover { background:var(--verde-osc); }
 .nota { font-size:.82rem; color:#5A6E63; margin-top:6px; }
 .fila { display:flex; gap:14px; flex-wrap:wrap; }
 .fila > div { flex:1; min-width:220px; }
-@media (max-width:600px){ .card{padding:16px} main{margin-top:14px} }
+table { width:100%; border-collapse:collapse; font-size:.85rem; }
+.tabla-scroll { overflow-x:auto; }
+th { background:var(--cabecera); color:var(--verde-osc); text-align:left; padding:8px; }
+td { padding:8px; border-bottom:1px solid var(--borde); }
+tr:nth-child(even) td { background:var(--fondo); }
+#chat-caja { border:1px solid var(--borde); border-radius:8px; height:420px; overflow-y:auto;
+             padding:14px; background:var(--fondo); margin-bottom:10px; }
+.msg { max-width:85%; padding:10px 14px; border-radius:10px; margin-bottom:10px;
+       white-space:pre-wrap; font-size:.92rem; }
+.msg-u { background:var(--verde); color:#fff; margin-left:auto; }
+.msg-a { background:#fff; border:1px solid var(--borde); }
+.msg-s { background:var(--cabecera); color:#5A6E63; font-size:.8rem; font-style:italic; }
+#chat-form { display:flex; gap:8px; }
+#chat-form input { flex:1; } #chat-form button { margin-top:0; }
+@media (max-width:600px){ .card{padding:16px} main{margin-top:14px} .msg{max-width:95%} }
 """
 
 
-def page(title: str, body: str, logged: bool = False) -> HTMLResponse:
-    nav = '<a href="/salir">Cerrar sesión</a>' if logged else ""
+def page(title: str, body: str, logged: bool = False, admin: bool = False) -> HTMLResponse:
+    nav = ""
+    if logged:
+        links = ['<a href="/panel">Panel</a>', '<a href="/chat">Chat de pruebas</a>']
+        if admin:
+            links.append('<a href="/admin">Administración</a>')
+        links.append('<a href="/salir">Salir</a>')
+        nav = "<nav>" + "".join(links) + "</nav>"
     return HTMLResponse(f"""<!doctype html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — Inhumario MCP</title><style>{CSS}</style></head><body>
@@ -249,9 +344,18 @@ def login_form(request: Request, error: str = ""):
 
 @panel_app.post("/login")
 def login(email: str = Form(...), password: str = Form(...)):
-    row = tenant_by("email", email.strip().lower())
+    email = email.strip().lower()
+    fails = _login_fails.get(email, [0, 0])
+    if fails[1] > time.time():
+        return RedirectResponse("/login?error=Demasiados intentos, espera un minuto", status_code=302)
+    row = tenant_by("email", email)
     if not row or not check_password(password, row["pass_hash"]):
+        fails[0] += 1
+        if fails[0] >= 5:
+            fails = [0, time.time() + 60]
+        _login_fails[email] = fails
         return RedirectResponse("/login?error=Email o contraseña incorrectos", status_code=302)
+    _login_fails.pop(email, None)
     resp = RedirectResponse("/panel", status_code=302)
     resp.set_cookie("sesion", make_session(row["email"]), httponly=True, secure=True,
                     samesite="lax", max_age=30 * 86400)
@@ -333,8 +437,10 @@ def panel(request: Request, ok: str = "", error: str = ""):
 <h3 style="margin-top:12px;color:var(--verde)">Otras IAs</h3>
 <p class="nota">Cualquier aplicación compatible con el estándar MCP (Copilot Studio, Cursor,
 LibreChat, etc.) puede usar la misma dirección. Tipo de servidor: «Streamable HTTP», sin autenticación.</p>
+<p class="nota">¿Sin suscripción de IA? Prueba tu Odoo desde el <a href="/chat">chat de pruebas</a>
+guardando abajo una clave API de Claude.</p>
 <form method="post" action="/panel/regenerar" onsubmit="return confirm('Si regeneras la dirección, la actual dejará de funcionar y tendrás que reconectar tus IAs. ¿Continuar?')">
-<button style="background:#8C2F1F">Regenerar dirección (si se ha filtrado)</button></form>
+<button class="btn-rojo">Regenerar dirección (si se ha filtrado)</button></form>
 </div>"""
 
     return page("Panel", f"""
@@ -350,19 +456,20 @@ LibreChat, etc.) puede usar la misma dirección. Tipo de servidor: «Streamable 
 <div><label>API key de Odoo</label><input type="password" name="odoo_key" placeholder="{'(guardada)' if row['odoo_key'] else ''}" {'' if row['odoo_key'] else 'required'}></div>
 </div>
 <p class="nota">La API key se crea en Odoo: Ajustes de usuario → Seguridad de la cuenta → Claves API.
-Se probará la conexión al guardar.</p>
+Se probará la conexión al guardar. Todas las claves se guardan cifradas.</p>
 <button>Guardar y probar conexión</button></form></div>
 {conexion}
-<div class="card"><h2>{'3' if row['last_test'] else '2'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(opcional — para el chat integrado, próximamente)</span></h2>
+<div class="card"><h2>{'3' if row['last_test'] else '2'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(para el chat de pruebas)</span></h2>
 <form method="post" action="/panel/ia">
 <label>Clave API de Claude (Anthropic)</label>
 <input type="password" name="ai_claude" placeholder="{'(guardada)' if row['ai_claude'] else 'sk-ant-...'}">
 <label>Otras claves (OpenAI, Gemini...)</label>
 <input type="password" name="ai_otras" placeholder="{'(guardada)' if row['ai_otras'] else ''}">
-<p class="nota">No hacen falta para conectar tu IA por conector: ahí usas tu propia suscripción.
-Estas claves solo se usarán para el futuro chat integrado en este panel.</p>
+<p class="nota">La clave de Claude activa el <a href="/chat">chat de pruebas</a> de este panel
+(ideal si aún no tienes suscripción de Claude/ChatGPT). Se guarda cifrada. Para los conectores
+no hace falta ninguna clave: ahí usas tu propia suscripción.</p>
 <button>Guardar claves</button></form></div>
-""", logged=True)
+""", logged=True, admin=es_admin(row))
 
 
 @panel_app.post("/panel/odoo")
@@ -371,8 +478,8 @@ def guardar_odoo(request: Request, odoo_url: str = Form(...), odoo_db: str = For
     row = read_session(request)
     if not row:
         return RedirectResponse("/login", status_code=302)
-    key = odoo_key.strip() or row["odoo_key"]
-    tenant = {"odoo_url": odoo_url.strip(), "odoo_db": odoo_db.strip(),
+    key = odoo_key.strip() or dec(row["odoo_key"])
+    tenant = {"id": row["id"], "odoo_url": odoo_url.strip(), "odoo_db": odoo_db.strip(),
               "odoo_user": odoo_user.strip(), "odoo_key": key}
     try:
         info = probar_conexion(tenant)
@@ -382,7 +489,7 @@ def guardar_odoo(request: Request, odoo_url: str = Form(...), odoo_db: str = For
     with db() as conn:
         conn.execute(
             "UPDATE tenants SET odoo_url=?, odoo_db=?, odoo_user=?, odoo_key=?, last_test=? WHERE id=?",
-            (tenant["odoo_url"], tenant["odoo_db"], tenant["odoo_user"], key, last_test, row["id"]),
+            (tenant["odoo_url"], tenant["odoo_db"], tenant["odoo_user"], enc(key), last_test, row["id"]),
         )
     return RedirectResponse("/panel?ok=Conexión con Odoo verificada y guardada", status_code=302)
 
@@ -392,9 +499,11 @@ def guardar_ia(request: Request, ai_claude: str = Form(""), ai_otras: str = Form
     row = read_session(request)
     if not row:
         return RedirectResponse("/login", status_code=302)
+    nueva_claude = enc(ai_claude.strip()) if ai_claude.strip() else row["ai_claude"]
+    nueva_otras = enc(ai_otras.strip()) if ai_otras.strip() else row["ai_otras"]
     with db() as conn:
         conn.execute("UPDATE tenants SET ai_claude=?, ai_otras=? WHERE id=?",
-                     (ai_claude.strip() or row["ai_claude"], ai_otras.strip() or row["ai_otras"], row["id"]))
+                     (nueva_claude, nueva_otras, row["id"]))
     return RedirectResponse("/panel?ok=Claves de IA guardadas", status_code=302)
 
 
@@ -406,3 +515,226 @@ def regenerar(request: Request):
     with db() as conn:
         conn.execute("UPDATE tenants SET token=? WHERE id=?", (new_token(), row["id"]))
     return RedirectResponse("/panel?ok=Dirección regenerada — reconecta tus IAs con la nueva", status_code=302)
+
+
+# ---------------------------------------------------------------- chat de demos
+
+SYSTEM_CHAT = (
+    "Eres el asistente de Odoo de la empresa del usuario, dentro del panel de Inhumario. "
+    "Tienes herramientas para consultar y modificar su Odoo real. Responde en el idioma del "
+    "usuario, con cifras claras. Antes de crear o modificar cualquier dato (odoo_crear, "
+    "odoo_escribir, odoo_ejecutar con efectos), resume lo que vas a hacer y pide confirmación "
+    "explícita en el chat. Para explorar un modelo desconocido usa odoo_campos u odoo_modelos."
+)
+
+_TOOL_OBJS = [srv.odoo_buscar, srv.odoo_contar, srv.odoo_leer, srv.odoo_crear, srv.odoo_escribir,
+              srv.odoo_ejecutar, srv.odoo_campos, srv.odoo_modelos, srv.odoo_info]
+
+
+def _anthropic_tools() -> list[dict]:
+    return [{"name": t.name, "description": t.description or "", "input_schema": t.parameters}
+            for t in _TOOL_OBJS]
+
+
+def _ejecutar_tool(nombre: str, args: dict):
+    for t in _TOOL_OBJS:
+        if t.name == nombre:
+            return t.fn(**args)
+    raise ValueError(f"Herramienta desconocida: {nombre}")
+
+
+@panel_app.get("/chat", response_class=HTMLResponse)
+def chat_page(request: Request):
+    row = read_session(request)
+    if not row:
+        return RedirectResponse("/login", status_code=302)
+    avisos = []
+    if not row["last_test"]:
+        avisos.append('Configura primero tu <a href="/panel">conexión con Odoo</a>.')
+    if not row["ai_claude"]:
+        avisos.append('Guarda tu <a href="/panel">clave API de Claude</a> para activar el chat.')
+    aviso_html = "".join(f'<div class="aviso-err">⚠️ {a}</div>' for a in avisos)
+    deshabilitado = "disabled" if avisos else ""
+    return page("Chat de pruebas", f"""
+<div class="card"><h2>Chat de pruebas con tu Odoo</h2>
+<p class="nota" style="margin-bottom:10px">Habla con tu Odoo usando tu clave API de Claude —
+sin necesidad de suscripción. Ideal para probar antes de conectar tu IA habitual.
+El coste de cada mensaje va contra tu clave API.</p>
+{aviso_html}
+<div id="chat-caja"><div class="msg msg-s">Prueba: «¿Cuántos pedidos llevamos este mes?» ·
+«Busca al cliente García» · «¿Qué facturas están pendientes?»</div></div>
+<form id="chat-form">
+<input id="chat-texto" placeholder="Escribe tu pregunta..." autocomplete="off" {deshabilitado}>
+<button {deshabilitado}>Enviar</button></form>
+</div>
+<script>
+let historial = [];
+const caja = document.getElementById('chat-caja');
+function burbuja(cls, texto) {{
+  const d = document.createElement('div'); d.className = 'msg ' + cls;
+  d.textContent = texto; caja.appendChild(d); caja.scrollTop = caja.scrollHeight; return d;
+}}
+document.getElementById('chat-form').addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  const input = document.getElementById('chat-texto');
+  const texto = input.value.trim(); if (!texto) return;
+  input.value = ''; input.disabled = true;
+  burbuja('msg-u', texto);
+  historial.push({{role: 'user', content: texto}});
+  const espera = burbuja('msg-s', 'Consultando tu Odoo...');
+  try {{
+    const r = await fetch('/chat/enviar', {{method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{mensajes: historial}})}});
+    const data = await r.json();
+    espera.remove();
+    if (data.error) {{ burbuja('msg-s', '❌ ' + data.error); }}
+    else {{ historial = data.mensajes; burbuja('msg-a', data.texto); }}
+  }} catch (err) {{ espera.remove(); burbuja('msg-s', '❌ Error de red: ' + err); }}
+  input.disabled = false; input.focus();
+}});
+</script>
+""", logged=True, admin=es_admin(row))
+
+
+@panel_app.post("/chat/enviar")
+def chat_enviar(request: Request, payload: dict):
+    row = read_session(request)
+    if not row:
+        return JSONResponse({"error": "Sesión caducada, recarga la página"}, status_code=401)
+    if not row["last_test"] or not row["odoo_url"]:
+        return JSONResponse({"error": "Configura primero tu conexión con Odoo en el panel"})
+    api_key = dec(row["ai_claude"])
+    if not api_key:
+        return JSONResponse({"error": "Guarda tu clave API de Claude en el panel"})
+
+    mensajes = payload.get("mensajes", [])[-40:]
+    if not mensajes:
+        return JSONResponse({"error": "Mensaje vacío"})
+
+    ctx = current_tenant.set(tenant_dict(row))
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        tools = _anthropic_tools()
+        for _ in range(10):
+            respuesta = client.messages.create(
+                model="claude-opus-5",
+                max_tokens=4096,
+                system=SYSTEM_CHAT,
+                messages=mensajes,
+                tools=tools,
+            )
+            contenido = [b.model_dump() for b in respuesta.content]
+            mensajes.append({"role": "assistant", "content": contenido})
+            if respuesta.stop_reason == "refusal":
+                return JSONResponse({"mensajes": mensajes,
+                                     "texto": "El modelo ha rechazado la petición por políticas de seguridad."})
+            if respuesta.stop_reason != "tool_use":
+                texto = "".join(b.text for b in respuesta.content if b.type == "text")
+                return JSONResponse({"mensajes": mensajes, "texto": texto or "(sin respuesta)"})
+            resultados = []
+            for b in respuesta.content:
+                if b.type == "tool_use":
+                    try:
+                        r = _ejecutar_tool(b.name, b.input or {})
+                        resultados.append({"type": "tool_result", "tool_use_id": b.id,
+                                           "content": json.dumps(r, ensure_ascii=False, default=str)[:60000]})
+                    except Exception as exc:
+                        resultados.append({"type": "tool_result", "tool_use_id": b.id,
+                                           "content": f"Error: {exc}", "is_error": True})
+            mensajes.append({"role": "user", "content": resultados})
+        return JSONResponse({"mensajes": mensajes,
+                             "texto": "La consulta necesitó demasiados pasos; prueba a acotarla."})
+    except anthropic.AuthenticationError:
+        return JSONResponse({"error": "La clave API de Claude no es válida — revísala en el panel"})
+    except anthropic.APIStatusError as exc:
+        return JSONResponse({"error": f"Error de la API de Claude ({exc.status_code}): {exc.message[:150]}"})
+    except Exception as exc:
+        return JSONResponse({"error": f"Error inesperado: {str(exc)[:180]}"})
+    finally:
+        current_tenant.reset(ctx)
+
+
+# ---------------------------------------------------------------- back office
+
+@panel_app.get("/admin", response_class=HTMLResponse)
+def admin(request: Request, ok: str = "", error: str = ""):
+    row = read_session(request)
+    if not es_admin(row):
+        return RedirectResponse("/login", status_code=302)
+    msg = ""
+    if ok:
+        msg = f'<div class="aviso-ok">{e(ok)}</div>'
+    if error:
+        msg = f'<div class="aviso-err">{e(error)}</div>'
+    with db() as conn:
+        tenants = conn.execute("SELECT * FROM tenants ORDER BY id").fetchall()
+        usos = dict(conn.execute(
+            "SELECT tenant_id, COUNT(*) FROM usos WHERE fecha > datetime('now','-30 days') GROUP BY tenant_id"
+        ).fetchall())
+    filas = ""
+    for t in tenants:
+        estado = "🟢" if t["activo"] else "🔴"
+        odoo = "✅" if t["last_test"] else "—"
+        filas += f"""<tr><td>{t['id']}</td><td>{e(t['empresa'])}</td><td>{e(t['email'])}</td>
+<td>{odoo}</td><td>{usos.get(t['id'], 0)}</td><td>{estado}</td><td style="white-space:nowrap">
+<form method="post" action="/admin/toggle" style="display:inline"><input type="hidden" name="tid" value="{t['id']}">
+<button class="btn-mini">{'Desactivar' if t['activo'] else 'Activar'}</button></form>
+<form method="post" action="/admin/borrar" style="display:inline" onsubmit="return confirm('¿Borrar definitivamente a {e(t['empresa'])}? Su conexión dejará de funcionar.')">
+<input type="hidden" name="tid" value="{t['id']}"><button class="btn-mini btn-rojo">Borrar</button></form>
+</td></tr>"""
+    return page("Administración", f"""
+{msg}
+<div class="card"><h2>Clientes ({len(tenants)})</h2>
+<div class="tabla-scroll"><table>
+<tr><th>ID</th><th>Empresa</th><th>Email</th><th>Odoo</th><th>Usos 30d</th><th>Estado</th><th>Acciones</th></tr>
+{filas}</table></div>
+<p class="nota">«Usos 30d» = llamadas a herramientas MCP en los últimos 30 días (la ruta legacy cuenta como ID 0).</p>
+</div>
+<div class="card"><h2>Dar de alta a un cliente</h2>
+<form method="post" action="/admin/crear">
+<div class="fila"><div><label>Empresa</label><input name="empresa" required></div>
+<div><label>Email</label><input type="email" name="email" required></div></div>
+<label>Contraseña provisional</label><input name="password" minlength="8" required>
+<p class="nota">Entrega al cliente el email y la contraseña provisional; que la cambie… en la fase
+siguiente (cambio de contraseña pendiente). Alternativa: dale el código de invitación
+<b>{e(ALTA_CODIGO)}</b> y que se registre él en {e(BASE_URL)}/alta.</p>
+<button>Crear cliente</button></form></div>
+""", logged=True, admin=True)
+
+
+@panel_app.post("/admin/crear")
+def admin_crear(request: Request, empresa: str = Form(...), email: str = Form(...), password: str = Form(...)):
+    row = read_session(request)
+    if not es_admin(row):
+        return RedirectResponse("/login", status_code=302)
+    email = email.strip().lower()
+    if tenant_by("email", email):
+        return RedirectResponse("/admin?error=Ya existe una cuenta con ese email", status_code=302)
+    with db() as conn:
+        conn.execute("INSERT INTO tenants (empresa, email, pass_hash, token) VALUES (?,?,?,?)",
+                     (empresa.strip(), email, hash_password(password), new_token()))
+    return RedirectResponse(f"/admin?ok=Cliente {empresa} creado — entrégale sus credenciales", status_code=302)
+
+
+@panel_app.post("/admin/toggle")
+def admin_toggle(request: Request, tid: int = Form(...)):
+    row = read_session(request)
+    if not es_admin(row):
+        return RedirectResponse("/login", status_code=302)
+    with db() as conn:
+        conn.execute("UPDATE tenants SET activo = 1 - activo WHERE id=?", (tid,))
+    return RedirectResponse("/admin?ok=Estado cambiado", status_code=302)
+
+
+@panel_app.post("/admin/borrar")
+def admin_borrar(request: Request, tid: int = Form(...)):
+    row = read_session(request)
+    if not es_admin(row):
+        return RedirectResponse("/login", status_code=302)
+    if row["id"] == tid:
+        return RedirectResponse("/admin?error=No puedes borrarte a ti mismo", status_code=302)
+    with db() as conn:
+        conn.execute("DELETE FROM tenants WHERE id=?", (tid,))
+        conn.execute("DELETE FROM usos WHERE tenant_id=?", (tid,))
+    return RedirectResponse("/admin?ok=Cliente borrado", status_code=302)
