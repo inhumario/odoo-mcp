@@ -119,6 +119,34 @@ mcp = FastMCP(
 )
 
 
+# Instrucciones por tenant: el campo "instrucciones" del panel se añade a las
+# instructions del servidor MCP en cada initialize. En stateless_http el SDK llama
+# a create_initialization_options() por petición, con el contextvar ya fijado por
+# el dispatcher, así que cada cliente recibe su propio "manual de la casa".
+def _instrucciones_tenant() -> str:
+    try:
+        return (current_tenant.get().get("instrucciones") or "").strip()
+    except LookupError:
+        return ""
+
+
+_orig_init_options = mcp._mcp_server.create_initialization_options
+
+
+def _init_options_con_instrucciones(*args, **kwargs):
+    opts = _orig_init_options(*args, **kwargs)
+    extra = _instrucciones_tenant()
+    if extra:
+        base = opts.instructions or ""
+        opts = opts.model_copy(update={
+            "instructions": f"{base}\n\n## Normas de trabajo de esta empresa (síguelas siempre, sin que el usuario las pida)\n\n{extra}"
+        })
+    return opts
+
+
+mcp._mcp_server.create_initialization_options = _init_options_con_instrucciones
+
+
 @mcp.tool
 def odoo_buscar(
     model: str,

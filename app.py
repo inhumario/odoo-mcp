@@ -54,6 +54,7 @@ if LEGACY_PATH and os.environ.get("ODOO_URL"):
         "odoo_db": os.environ["ODOO_DB"],
         "odoo_user": os.environ["ODOO_USER"],
         "odoo_key": os.environ["ODOO_API_KEY"],
+        "instrucciones": os.environ.get("MCP_INSTRUCCIONES", ""),
     }
 
 # ---------------------------------------------------------------- cifrado
@@ -103,6 +104,8 @@ def init_db() -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(tenants)")]
         if "activo" not in cols:
             conn.execute("ALTER TABLE tenants ADD COLUMN activo INTEGER DEFAULT 1")
+        if "instrucciones" not in cols:
+            conn.execute("ALTER TABLE tenants ADD COLUMN instrucciones TEXT DEFAULT ''")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS usos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +202,8 @@ async def _plain_response(send, status: int, text: str) -> None:
 
 def tenant_dict(row) -> dict:
     return {"id": row["id"], "odoo_url": row["odoo_url"], "odoo_db": row["odoo_db"],
-            "odoo_user": row["odoo_user"], "odoo_key": dec(row["odoo_key"])}
+            "odoo_user": row["odoo_user"], "odoo_key": dec(row["odoo_key"]),
+            "instrucciones": row["instrucciones"] or ""}
 
 
 class RootDispatcher:
@@ -267,9 +271,10 @@ main { max-width:900px; margin:26px auto; padding:0 16px 48px; }
            border-bottom:2px solid var(--ink); padding-bottom:7px; letter-spacing:.01em; }
 .card h3 { color:var(--ink) !important; }
 label { display:block; font-size:.85rem; font-weight:600; margin:10px 0 4px; color:var(--ink-soft); }
-input { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px;
+input, textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px;
         font-size:.95rem; font-family:inherit; background:#fff; }
-input:focus { outline:2px solid var(--ink); border-color:var(--ink); }
+input:focus, textarea:focus { outline:2px solid var(--ink); border-color:var(--ink); }
+textarea { min-height:220px; resize:vertical; line-height:1.5; }
 button { background:var(--ink); color:#fff; border:0; border-radius:8px;
          padding:11px 22px; font-size:.95rem; font-weight:600; cursor:pointer;
          margin-top:14px; font-family:inherit; }
@@ -472,7 +477,15 @@ guardando abajo una clave API de Claude.</p>
 Se probará la conexión al guardar. Todas las claves se guardan cifradas.</p>
 <button>Guardar y probar conexión</button></form></div>
 {conexion}
-<div class="card"><h2>{'3' if row['last_test'] else '2'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(para el chat de pruebas)</span></h2>
+<div class="card"><h2>{'3' if row['last_test'] else '2'} · Cómo trabaja tu empresa <span style="font-weight:400;font-size:.8rem">(opcional)</span></h2>
+<form method="post" action="/panel/instrucciones">
+<label>Instrucciones para tu IA</label>
+<textarea name="instrucciones" placeholder="Ejemplo: Las órdenes de fabricación se crean siempre con su lista de materiales, indicando lote y subproductos. Los pedidos B2B llevan la tarifa mayorista...">{e(row['instrucciones'] or '')}</textarea>
+<p class="nota">Todo lo que escribas aquí se entrega automáticamente a tu IA cada vez que se
+conecta: tus convenciones, cómo creáis pedidos o fabricaciones, qué no debe tocar…
+No hace falta repetirlo en cada conversación. Se aplica al guardar, sin reconectar nada.</p>
+<button>Guardar instrucciones</button></form></div>
+<div class="card"><h2>{'4' if row['last_test'] else '3'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(para el chat de pruebas)</span></h2>
 <form method="post" action="/panel/ia">
 <label>Clave API de Claude (Anthropic)</label>
 <input type="password" name="ai_claude" placeholder="{'(guardada)' if row['ai_claude'] else 'sk-ant-...'}">
@@ -505,6 +518,17 @@ def guardar_odoo(request: Request, odoo_url: str = Form(...), odoo_db: str = For
             (tenant["odoo_url"], tenant["odoo_db"], tenant["odoo_user"], enc(key), last_test, row["id"]),
         )
     return RedirectResponse("/panel?ok=Conexión con Odoo verificada y guardada", status_code=302)
+
+
+@panel_app.post("/panel/instrucciones")
+def guardar_instrucciones(request: Request, instrucciones: str = Form("")):
+    row = read_session(request)
+    if not row:
+        return RedirectResponse("/login", status_code=302)
+    with db() as conn:
+        conn.execute("UPDATE tenants SET instrucciones=? WHERE id=?",
+                     (instrucciones.strip(), row["id"]))
+    return RedirectResponse("/panel?ok=Instrucciones guardadas — tu IA las recibirá en la próxima conversación", status_code=302)
 
 
 @panel_app.post("/panel/ia")
@@ -630,10 +654,13 @@ def chat_enviar(request: Request, payload: dict):
         client = anthropic.Anthropic(api_key=api_key)
         tools = _anthropic_tools()
         for _ in range(10):
+            instrucciones = (row["instrucciones"] or "").strip()
+            sistema = SYSTEM_CHAT if not instrucciones else (
+                f"{SYSTEM_CHAT}\n\nNormas de trabajo de esta empresa (síguelas siempre):\n{instrucciones}")
             respuesta = client.messages.create(
                 model="claude-opus-5",
                 max_tokens=4096,
-                system=SYSTEM_CHAT,
+                system=sistema,
                 messages=mensajes,
                 tools=tools,
             )
