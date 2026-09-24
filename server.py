@@ -10,8 +10,20 @@ Compatibilidad: si MCP_PATH + ODOO_* están en el entorno, esa ruta "legacy"
 sigue sirviendo el tenant del entorno (el conector original de Mario).
 """
 
+import base64
 import contextvars
+import datetime as _dt
+import email
+import email.header
+import html
+import imaplib
+import ipaddress
 import json
+import mimetypes
+import re
+import socket
+import urllib.parse
+import urllib.request
 import xmlrpc.client
 from typing import Any
 
@@ -133,14 +145,37 @@ def _instrucciones_tenant() -> str:
 _orig_init_options = mcp._mcp_server.create_initialization_options
 
 
+def _buzon_tenant() -> dict | None:
+    """Config del buzón de adjuntos del tenant (host, user, pass, direccion) o None."""
+    try:
+        t = current_tenant.get()
+    except LookupError:
+        return None
+    if t.get("buzon_host") and t.get("buzon_user") and t.get("buzon_pass"):
+        return {"host": t["buzon_host"], "user": t["buzon_user"], "pass": t["buzon_pass"],
+                "direccion": (t.get("buzon_direccion") or t["buzon_user"]).strip()}
+    return None
+
+
 def _init_options_con_instrucciones(*args, **kwargs):
     opts = _orig_init_options(*args, **kwargs)
+    partes = []
     extra = _instrucciones_tenant()
     if extra:
+        partes.append("## Normas de trabajo de esta empresa (síguelas siempre, sin que el usuario las pida)\n\n" + extra)
+    buzon = _buzon_tenant()
+    if buzon:
+        partes.append(
+            "## Buzón de adjuntos (activo)\n\n"
+            f"Para adjuntar a un registro de Odoo un fichero que está en un email (p.ej. el PDF de una "
+            f"factura de proveedor): reenvía ese email, con sus adjuntos, a **{buzon['direccion']}** y "
+            "después llama a `odoo_adjuntar_desde_buzon` indicando en `buscar` un texto que identifique "
+            "el mensaje (número de factura, asunto…). Si el fichero está en una URL pública o es pequeño, "
+            "usa `odoo_adjuntar`. Nunca des por terminada una factura de proveedor sin su PDF adjunto."
+        )
+    if partes:
         base = opts.instructions or ""
-        opts = opts.model_copy(update={
-            "instructions": f"{base}\n\n## Normas de trabajo de esta empresa (síguelas siempre, sin que el usuario las pida)\n\n{extra}"
-        })
+        opts = opts.model_copy(update={"instructions": base + "\n\n" + "\n\n".join(partes)})
     return opts
 
 
@@ -271,3 +306,272 @@ def odoo_info() -> Any:
     """Comprueba la conexión con Odoo y devuelve versión del servidor y usuario conectado."""
     t = _tenant()
     return _result(probar_conexion(t))
+
+
+# ---------------------------------------------------------------- adjuntos
+
+MAX_ADJUNTO = 25 * 1024 * 1024  # 25 MB
+
+
+def _adjuntos_existentes(model: str, res_id: int) -> list[dict]:
+    return _execute("ir.attachment", "search_read",
+                    [[["res_model", "=", model], ["res_id", "=", res_id]]],
+                    {"fields": ["id", "name", "file_size", "mimetype"]})
+
+
+def _crear_adjunto(model: str, res_id: int, nombre: str, contenido: bytes, mimetype: str | None = None) -> dict:
+    """Crea un ir.attachment sobre el registro. Si ya hay uno con mismo nombre y tamaño, no duplica."""
+    if not contenido:
+        raise ValueError(f"El fichero {nombre} está vacío")
+    if len(contenido) > MAX_ADJUNTO:
+        raise ValueError(f"El fichero {nombre} pesa {len(contenido)//1024} KB; máximo {MAX_ADJUNTO//1024//1024} MB")
+    mimetype = mimetype or mimetypes.guess_type(nombre)[0] or "application/octet-stream"
+    for a in _adjuntos_existentes(model, res_id):
+        if a["name"] == nombre and a["file_size"] == len(contenido):
+            return {"id": a["id"], "nombre": nombre, "bytes": len(contenido), "duplicado": True,
+                    "aviso": "Ya existía un adjunto idéntico en el registro; no se ha duplicado"}
+    att_id = _execute("ir.attachment", "create", [{
+        "name": nombre, "res_model": model, "res_id": res_id, "type": "binary",
+        "mimetype": mimetype, "datas": base64.b64encode(contenido).decode(),
+    }])
+    return {"id": att_id, "nombre": nombre, "bytes": len(contenido), "mimetype": mimetype, "duplicado": False}
+
+
+def _comprobar_registro(model: str, res_id: int) -> str:
+    """Verifica que el registro existe y devuelve su display_name."""
+    r = _execute(model, "read", [[res_id]], {"fields": ["display_name"]})
+    if not r:
+        raise ValueError(f"No existe {model} con id {res_id}")
+    return r[0]["display_name"]
+
+
+def _url_segura(url: str) -> None:
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("Solo se admiten URLs http(s) públicas")
+    for info in socket.getaddrinfo(p.hostname, None):
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError("La URL apunta a una dirección privada; no se permite")
+
+
+def _descargar(url: str) -> tuple[bytes, str | None, str]:
+    _url_segura(url)
+    req = urllib.request.Request(url, headers={"User-Agent": "Inhumario-MCP/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(MAX_ADJUNTO + 1)
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip() or None
+        nombre = ""
+        cd = r.headers.get("Content-Disposition") or ""
+        m = [x for x in cd.split(";") if "filename=" in x]
+        if m:
+            nombre = m[0].split("=", 1)[1].strip().strip('"')
+    if not nombre:
+        nombre = urllib.parse.unquote(urllib.parse.urlparse(url).path.rsplit("/", 1)[-1]) or "adjunto"
+    return data, ctype, nombre
+
+
+@mcp.tool
+def odoo_adjuntar(
+    model: str,
+    res_id: int,
+    nombre: str | None = None,
+    contenido_base64: str | None = None,
+    url: str | None = None,
+) -> Any:
+    """Adjunta un fichero a un registro de Odoo (ir.attachment), p.ej. el PDF de una factura.
+
+    Indica UNA fuente: `contenido_base64` (fichero pequeño codificado en base64) o `url`
+    (dirección http(s) pública desde la que el servidor descarga el fichero).
+    Si el fichero está en un email, usa `odoo_adjuntar_desde_buzon` en su lugar.
+
+    Args:
+        model: modelo del registro, p.ej. 'account.move' (factura), 'purchase.order', 'res.partner'.
+        res_id: ID del registro al que se adjunta.
+        nombre: nombre del fichero con extensión, p.ej. 'Factura R1169785.pdf'.
+            Obligatorio con contenido_base64; con url se deduce si se omite.
+        contenido_base64: contenido del fichero en base64.
+        url: URL pública del fichero.
+    """
+    if bool(contenido_base64) == bool(url):
+        raise ValueError("Indica exactamente una fuente: contenido_base64 o url")
+    registro = _comprobar_registro(model, res_id)
+    if contenido_base64:
+        if not nombre:
+            raise ValueError("Con contenido_base64 hay que indicar el nombre del fichero")
+        contenido, mimetype = base64.b64decode(contenido_base64), None
+    else:
+        contenido, mimetype, nombre_url = _descargar(url)
+        nombre = nombre or nombre_url
+    res = _crear_adjunto(model, res_id, nombre, contenido, mimetype)
+    return _result({"registro": registro, "adjunto": res})
+
+
+def _decodificar_cabecera(valor) -> str:
+    if not valor:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(valor)))
+    except Exception:
+        return str(valor)
+
+
+def _texto_plano(msg) -> str:
+    """Texto del cuerpo (partes text/plain y text/html sin etiquetas) para buscar en él."""
+    trozos = []
+    for part in msg.walk():
+        if part.get_content_maintype() != "text" or part.get_filename():
+            continue
+        try:
+            texto = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+        except Exception:
+            continue
+        if part.get_content_subtype() == "html":
+            texto = html.unescape(re.sub(r"<[^>]+>", " ", texto))
+        trozos.append(texto)
+    return "\n".join(trozos)
+
+
+def _adjuntos_de(msg) -> list[tuple[str, bytes, str]]:
+    out = []
+    for part in msg.walk():
+        nombre = part.get_filename()
+        if not nombre or part.get_content_maintype() == "multipart":
+            continue
+        nombre = _decodificar_cabecera(nombre)
+        datos = part.get_payload(decode=True) or b""
+        out.append((nombre, datos, part.get_content_type()))
+    return out
+
+
+def _carpeta_todos(m: imaplib.IMAP4) -> str:
+    """Carpeta que contiene todo el correo (\\All en Gmail, INBOX en el resto)."""
+    try:
+        typ, carpetas = m.list()
+        for c in carpetas or []:
+            linea = c.decode(errors="replace") if isinstance(c, bytes) else str(c)
+            if "\\All" in linea:
+                return linea.rsplit(" ", 1)[-1]
+    except Exception:
+        pass
+    return "INBOX"
+
+
+def probar_buzon(cfg: dict) -> dict:
+    """Usado por el panel: comprueba login IMAP y devuelve la carpeta que se leerá."""
+    m = imaplib.IMAP4_SSL(cfg["host"], timeout=20)
+    try:
+        m.login(cfg["user"], cfg["pass"])
+        carpeta = _carpeta_todos(m)
+        typ, _ = m.select(carpeta, readonly=True)
+        if typ != "OK":
+            raise RuntimeError(f"No se pudo abrir la carpeta {carpeta}")
+        return {"carpeta": carpeta}
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def _mensajes_buzon(cfg: dict, dias: int, maximo: int = 25) -> list[tuple[bytes, Any]]:
+    """Devuelve [(uid, mensaje)] del buzón, los más recientes primero."""
+    m = imaplib.IMAP4_SSL(cfg["host"], timeout=30)
+    try:
+        m.login(cfg["user"], cfg["pass"])
+        m.select(_carpeta_todos(m), readonly=True)
+        desde = (_dt.date.today() - _dt.timedelta(days=dias)).strftime("%d-%b-%Y")
+        criterios = ["SINCE", desde]
+        if cfg.get("direccion"):
+            criterios += ["TO", cfg["direccion"]]
+        typ, data = m.uid("search", None, *criterios)
+        uids = (data[0] or b"").split()
+        uids = uids[-maximo:][::-1]
+        out = []
+        for uid in uids:
+            typ, partes = m.uid("fetch", uid, "(RFC822)")
+            for p in partes or []:
+                if isinstance(p, tuple) and len(p) > 1:
+                    out.append((uid, email.message_from_bytes(p[1])))
+        return out
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+@mcp.tool
+def odoo_adjuntar_desde_buzon(
+    model: str,
+    res_id: int,
+    buscar: str | None = None,
+    nombre_adjunto: str | None = None,
+    tipos: list[str] | None = None,
+    dias: int = 3,
+    solo_listar: bool = False,
+) -> Any:
+    """Adjunta a un registro de Odoo los ficheros de un email recibido en el buzón de adjuntos.
+
+    Flujo: primero reenvía el email que contiene el fichero (p.ej. el PDF de la factura) a la
+    dirección del buzón de adjuntos que aparece en las instrucciones de este servidor; después
+    llama a esta herramienta. Se toma el mensaje MÁS RECIENTE del buzón que encaje con `buscar`
+    y se adjuntan sus ficheros (por defecto solo PDF) al registro. No duplica adjuntos idénticos.
+
+    Args:
+        model: modelo del registro, p.ej. 'account.move' (factura de proveedor).
+        res_id: ID del registro.
+        buscar: texto que identifica el email (nº de factura, asunto, remitente…). Se busca en
+            asunto, remitente, cuerpo y nombres de adjuntos, sin distinguir mayúsculas. Si se
+            omite, se usa el email más reciente del buzón que tenga adjuntos.
+        nombre_adjunto: si el email trae varios ficheros, texto que debe contener el nombre del
+            que se quiere adjuntar.
+        tipos: extensiones admitidas, por defecto ["pdf"]. Usa ["*"] para adjuntar todo.
+        dias: cuántos días hacia atrás mirar en el buzón (por defecto 3).
+        solo_listar: si true, no adjunta nada: devuelve los emails del buzón que encajan y sus
+            ficheros, para comprobar antes.
+    """
+    cfg = _buzon_tenant()
+    if not cfg:
+        raise RuntimeError("Este cliente no tiene configurado el buzón de adjuntos (panel → Buzón de adjuntos)")
+    tipos = [t.lower().lstrip(".") for t in (tipos or ["pdf"])]
+    aguja = (buscar or "").strip().lower()
+    candidatos = []
+    for uid, msg in _mensajes_buzon(cfg, max(1, min(dias, 60))):
+        adj = _adjuntos_de(msg)
+        if not adj:
+            continue
+        asunto = _decodificar_cabecera(msg.get("Subject"))
+        remitente = _decodificar_cabecera(msg.get("From"))
+        if aguja:
+            pajar = " ".join([asunto, remitente, _texto_plano(msg)] + [n for n, _, _ in adj]).lower()
+            if aguja not in pajar:
+                continue
+        candidatos.append({"uid": uid.decode(), "asunto": asunto, "de": remitente,
+                           "fecha": msg.get("Date"), "ficheros": [(n, len(d), ct) for n, d, ct in adj],
+                           "_adj": adj})
+    if solo_listar:
+        return _result([{k: v for k, v in c.items() if k != "_adj"} for c in candidatos])
+    if not candidatos:
+        raise RuntimeError(
+            f"No hay en el buzón ({cfg['direccion']}, últimos {dias} días) ningún email con adjuntos"
+            + (f" que contenga «{buscar}»" if buscar else "")
+            + ". Reenvía primero el email al buzón y vuelve a intentarlo (puede tardar unos segundos en llegar)."
+        )
+    registro = _comprobar_registro(model, res_id)
+    elegido = candidatos[0]
+    resultados, omitidos = [], []
+    for nombre, datos, ctype in elegido["_adj"]:
+        ext = nombre.rsplit(".", 1)[-1].lower() if "." in nombre else ""
+        if "*" not in tipos and ext not in tipos:
+            omitidos.append(f"{nombre} (tipo .{ext} no pedido)")
+            continue
+        if nombre_adjunto and nombre_adjunto.lower() not in nombre.lower():
+            omitidos.append(f"{nombre} (no contiene «{nombre_adjunto}»)")
+            continue
+        resultados.append(_crear_adjunto(model, res_id, nombre, datos, ctype))
+    if not resultados:
+        raise RuntimeError(f"El email «{elegido['asunto']}» no tiene ficheros que encajen. Omitidos: {omitidos}")
+    return _result({"registro": registro, "email": {k: v for k, v in elegido.items() if k not in ("_adj", "ficheros")},
+                    "adjuntados": resultados, "omitidos": omitidos,
+                    "otros_emails_que_encajaban": len(candidatos) - 1})

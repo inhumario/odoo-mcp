@@ -34,7 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import server as srv
-from server import mcp, current_tenant, probar_conexion
+from server import mcp, current_tenant, probar_conexion, probar_buzon
 
 SECRET_KEY = os.environ["SECRET_KEY"]
 ENCRYPT_KEY = os.environ["ENCRYPT_KEY"]
@@ -55,6 +55,10 @@ if LEGACY_PATH and os.environ.get("ODOO_URL"):
         "odoo_user": os.environ["ODOO_USER"],
         "odoo_key": os.environ["ODOO_API_KEY"],
         "instrucciones": os.environ.get("MCP_INSTRUCCIONES", ""),
+        "buzon_host": os.environ.get("BUZON_HOST", ""),
+        "buzon_user": os.environ.get("BUZON_USER", ""),
+        "buzon_pass": os.environ.get("BUZON_PASS", ""),
+        "buzon_direccion": os.environ.get("BUZON_DIRECCION", ""),
     }
 
 # ---------------------------------------------------------------- cifrado
@@ -106,6 +110,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tenants ADD COLUMN activo INTEGER DEFAULT 1")
         if "instrucciones" not in cols:
             conn.execute("ALTER TABLE tenants ADD COLUMN instrucciones TEXT DEFAULT ''")
+        for col in ("buzon_host", "buzon_user", "buzon_pass", "buzon_direccion"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE tenants ADD COLUMN {col} TEXT DEFAULT ''")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS usos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -203,7 +210,9 @@ async def _plain_response(send, status: int, text: str) -> None:
 def tenant_dict(row) -> dict:
     return {"id": row["id"], "odoo_url": row["odoo_url"], "odoo_db": row["odoo_db"],
             "odoo_user": row["odoo_user"], "odoo_key": dec(row["odoo_key"]),
-            "instrucciones": row["instrucciones"] or ""}
+            "instrucciones": row["instrucciones"] or "",
+            "buzon_host": row["buzon_host"] or "", "buzon_user": row["buzon_user"] or "",
+            "buzon_pass": dec(row["buzon_pass"] or ""), "buzon_direccion": row["buzon_direccion"] or ""}
 
 
 class RootDispatcher:
@@ -485,7 +494,25 @@ Se probará la conexión al guardar. Todas las claves se guardan cifradas.</p>
 conecta: tus convenciones, cómo creáis pedidos o fabricaciones, qué no debe tocar…
 No hace falta repetirlo en cada conversación. Se aplica al guardar, sin reconectar nada.</p>
 <button>Guardar instrucciones</button></form></div>
-<div class="card"><h2>{'4' if row['last_test'] else '3'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(para el chat de pruebas)</span></h2>
+<div class="card"><h2>{'4' if row['last_test'] else '3'} · Buzón de adjuntos <span style="font-weight:400;font-size:.8rem">(opcional)</span></h2>
+<p class="nota" style="margin-bottom:6px">Permite a tu IA adjuntar a Odoo ficheros que están en un email
+(el PDF de una factura de proveedor, un albarán…): la IA reenvía el email a esta dirección y el
+servidor lo lee por IMAP y lo adjunta al registro. Sirve cualquier buzón IMAP; en Gmail usa una
+<b>contraseña de aplicación</b> y, si quieres, una dirección con «+» (p.ej. <i>tu.nombre+odoo@tuempresa.com</i>)
+con un filtro que la archive.</p>
+<form method="post" action="/panel/buzon">
+<div class="fila">
+<div><label>Servidor IMAP</label><input name="buzon_host" placeholder="imap.gmail.com" value="{e(row['buzon_host'])}"></div>
+<div><label>Usuario (email de la cuenta)</label><input name="buzon_user" placeholder="tu.nombre@tuempresa.com" value="{e(row['buzon_user'])}"></div>
+</div>
+<div class="fila">
+<div><label>Contraseña (de aplicación)</label><input type="password" name="buzon_pass" placeholder="{'(guardada)' if row['buzon_pass'] else ''}"></div>
+<div><label>Dirección a la que reenviar</label><input name="buzon_direccion" placeholder="tu.nombre+odoo@tuempresa.com" value="{e(row['buzon_direccion'])}"></div>
+</div>
+<p class="nota">Se comprobará el acceso IMAP al guardar. La contraseña se guarda cifrada. Deja el servidor
+vacío y guarda para desactivar el buzón.</p>
+<button>Guardar y probar buzón</button></form></div>
+<div class="card"><h2>{'5' if row['last_test'] else '4'} · Claves de IA <span style="font-weight:400;font-size:.8rem">(para el chat de pruebas)</span></h2>
 <form method="post" action="/panel/ia">
 <label>Clave API de Claude (Anthropic)</label>
 <input type="password" name="ai_claude" placeholder="{'(guardada)' if row['ai_claude'] else 'sk-ant-...'}">
@@ -531,6 +558,33 @@ def guardar_instrucciones(request: Request, instrucciones: str = Form("")):
     return RedirectResponse("/panel?ok=Instrucciones guardadas — tu IA las recibirá en la próxima conversación", status_code=302)
 
 
+@panel_app.post("/panel/buzon")
+def guardar_buzon(request: Request, buzon_host: str = Form(""), buzon_user: str = Form(""),
+                  buzon_pass: str = Form(""), buzon_direccion: str = Form("")):
+    row = read_session(request)
+    if not row:
+        return RedirectResponse("/login", status_code=302)
+    host, user = buzon_host.strip(), buzon_user.strip()
+    direccion = buzon_direccion.strip() or user
+    if not host:
+        with db() as conn:
+            conn.execute("UPDATE tenants SET buzon_host='', buzon_user='', buzon_pass='', buzon_direccion='' WHERE id=?",
+                         (row["id"],))
+        return RedirectResponse("/panel?ok=Buzón de adjuntos desactivado", status_code=302)
+    password = buzon_pass.strip() or dec(row["buzon_pass"] or "")
+    if not user or not password:
+        return RedirectResponse("/panel?error=El buzón necesita usuario y contraseña", status_code=302)
+    try:
+        info = probar_buzon({"host": host, "user": user, "pass": password, "direccion": direccion})
+    except Exception as exc:
+        return RedirectResponse(f"/panel?error=No se pudo acceder al buzón IMAP: {str(exc)[:180]}", status_code=302)
+    with db() as conn:
+        conn.execute("UPDATE tenants SET buzon_host=?, buzon_user=?, buzon_pass=?, buzon_direccion=? WHERE id=?",
+                     (host, user, enc(password), direccion, row["id"]))
+    return RedirectResponse(f"/panel?ok=Buzón verificado (carpeta {info['carpeta']}) — tu IA ya puede adjuntar "
+                            f"ficheros reenviando emails a {direccion}", status_code=302)
+
+
 @panel_app.post("/panel/ia")
 def guardar_ia(request: Request, ai_claude: str = Form(""), ai_otras: str = Form("")):
     row = read_session(request)
@@ -565,7 +619,8 @@ SYSTEM_CHAT = (
 )
 
 _TOOL_OBJS = [srv.odoo_buscar, srv.odoo_contar, srv.odoo_leer, srv.odoo_crear, srv.odoo_escribir,
-              srv.odoo_ejecutar, srv.odoo_campos, srv.odoo_modelos, srv.odoo_info]
+              srv.odoo_ejecutar, srv.odoo_campos, srv.odoo_modelos, srv.odoo_info,
+              srv.odoo_adjuntar, srv.odoo_adjuntar_desde_buzon]
 
 
 def _anthropic_tools() -> list[dict]:

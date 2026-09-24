@@ -7,9 +7,13 @@ multi-tenant con panel de autogestión.
 - **Panel** (`app.py`): alta con código de invitación, credenciales de Odoo
   (verificadas al guardar), URL MCP privada por cliente e instrucciones de
   conexión. Claves de IA opcionales para el futuro chat integrado.
-- **MCP** (`server.py`): 9 herramientas XML-RPC (buscar, contar, leer, crear,
-  escribir, ejecutar genérico, campos, modelos, info) con las credenciales del
-  tenant activo. Endpoint por cliente: `/t/<token>/mcp` (Streamable HTTP).
+- **MCP** (`server.py`): 11 herramientas XML-RPC (buscar, contar, leer, crear,
+  escribir, ejecutar genérico, campos, modelos, info, adjuntar, adjuntar desde
+  buzón) con las credenciales del tenant activo. Endpoint por cliente:
+  `/t/<token>/mcp` (Streamable HTTP).
+- **Buzón de adjuntos** (opcional por tenant): la IA reenvía un email a la
+  dirección del buzón y `odoo_adjuntar_desde_buzon` lee el mensaje por IMAP y
+  adjunta sus ficheros (PDF de facturas, albaranes…) al registro de Odoo.
 
 ## Despliegue
 
